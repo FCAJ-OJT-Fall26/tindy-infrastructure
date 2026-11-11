@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tindy CloudFront edge in maintenance mode with a private S3 frontend origin.
+
+Parameters:
+  FrontendBucketName:
+    Type: String
+    Description: FrontendBucketName output from tindy-foundation in the same Region.
+    AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
+    ConstraintDescription: Use the generated S3 frontend bucket name without dots.
+
+# Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
+Resources:
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend'
+        Description: Signs CloudFront reads from the private Tindy frontend bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  MaintenanceRoutingFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-maintenance-routing'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Handles maintenance responses and known Tindy frontend routes.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        const spaRoutes = [
+          '/', '/ai', '/ai-studio', '/applications', '/auth/oauth/callback',
+          '/candidates', '/components', '/create-project', '/discover',
+          '/interests', '/leader', '/leader/applications', '/login', '/messages',
+          '/notifications', '/onboarding', '/privacypolicy', '/profile',
+          '/projects', '/register', '/saved', '/settings', '/team', '/termsofservice'
+        ];
+        const spaDetailRoute = /^\/(?:(?:candidate|team|users)\/[^/.]+|project\/[^/.]+(?:\/(?:applications|edit|workspace))?|projects\/[^/.]+\/applications)$/;
+
+        function handler(event) {
+          const request = event.request;
+          const path = request.uri.toLowerCase().replace(/\/+$/, '') || '/';
+
+          if (/^\/(?:api|hubs)(?:\/|$)|^\/signin-(?:google|github)$/.test(path)) {
+            const response = {
+              statusCode: 503,
+              statusDescription: 'Service Unavailable',
+              headers: {
+                'cache-control': { value: 'no-store' },
+                'content-type': { value: 'application/json; charset=utf-8' }
+              }
+            };
+            if (request.method !== 'HEAD') {
+              response.body = '{"status":"maintenance"}';
+            }
+            return response;
+          }
+
+          // The behavior accepts all methods so backend POST requests reach this function.
+          if (request.method !== 'GET' && request.method !== 'HEAD') {
+            return {
+              statusCode: 405,
+              statusDescription: 'Method Not Allowed',
+              headers: { allow: { value: 'GET, HEAD' } }
+            };
+          }
+
+          if (spaRoutes.includes(path) || spaDetailRoute.test(path)) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  EdgeDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Tindy application edge
+        Enabled: true
+        HttpVersion: http2
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: frontend-s3
+            DomainName: !Sub '${FrontendBucketName}.s3.${AWS::Region}.${AWS::URLSuffix}'
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          # AWS-managed CachingDisabled for HTML and maintenance responses.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt MaintenanceRoutingFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: '/assets/*'
+            TargetOriginId: frontend-s3
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            # AWS-managed CachingOptimized for content-hashed Vite assets.
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowReadFromTindyDistribution
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${FrontendBucketName}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${EdgeDistribution}'
+
+Outputs:
+  DistributionId:
+    Value: !Ref EdgeDistribution
+
+  DistributionDomainName:
+    Value: !GetAtt EdgeDistribution.DomainName
+
+  EdgeMode:
+    Value: maintenance
