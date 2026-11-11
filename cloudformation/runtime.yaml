@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tindy ECS Fargate API, internal ALB, and CloudFront VPC Origin.
+
+Parameters:
+  ApiImage:
+    Type: String
+    Description: Verified tindy-api ECR image URI pinned to its digest.
+    AllowedPattern: '[0-9]{12}\.dkr\.ecr\.us-east-1\.amazonaws\.com/tindy-api@sha256:[0-9a-f]{64}'
+
+  DesiredCount:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 1]
+    Description: Start at zero. Set to one after database preparation and API secrets are ready.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  PublicTaskSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+
+  PrivateAppSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+
+  AlbSubnetCidrs:
+    Type: CommaDelimitedList
+    Description: Two private ALB subnet CIDRs from tindy-network.
+
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  EcsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  CloudFrontOriginPrefixListId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(pl-[0-9a-f]+)?'
+    Description: IPv4 com.amazonaws.global.cloudfront.origin-facing prefix list ID for bootstrap.
+
+  CloudFrontServiceSecurityGroupId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(sg-[0-9a-f]+)?'
+    Description: Use the service-managed group after VPC Origin deploys. Clear this and use the prefix list before teardown.
+
+  CloudFrontPublicHost:
+    Type: String
+    AllowedPattern: '[a-z0-9-]+\.cloudfront\.net'
+    Description: DistributionDomainName output from tindy-edge.
+
+  DatabaseConnectionSecretArn:
+    Type: String
+    Description: Foundation secret ARN holding the complete API PostgreSQL connection string as SecretString.
+
+  JwtSigningKeySecretArn:
+    Type: String
+    Description: Foundation secret ARN holding the Base64 JWT signing key as SecretString.
+
+  DataProtectionParameterPath:
+    Type: String
+    Default: /tindy/data-protection
+    AllowedPattern: '/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*'
+    Description: Dedicated SSM path from tindy-foundation for API Data Protection keys.
+
+  DBProvisionMode:
+    Type: String
+    Default: Fresh
+    AllowedValues: [Fresh, Restore]
+    Description: DBProvisionMode output from tindy-database.
+
+  MigrationConnectionSecretArn:
+    Type: String
+    Default: ''
+    Description: Optional ARN for the migration role PostgreSQL connection string as SecretString.
+
+  SeedPasswordSecretArn:
+    Type: String
+    Default: ''
+    Description: Optional ARN for the Fresh seed password as SecretString.
+
+Rules:
+  RequireCloudFrontIngressSource:
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref CloudFrontOriginPrefixListId, '']]
+          - !Not [!Equals [!Ref CloudFrontServiceSecurityGroupId, '']]
+        AssertDescription: Supply the CloudFront IPv4 prefix list or its service-managed security group.
+
+Conditions:
+  UseCloudFrontServiceSecurityGroup: !Not [!Equals [!Ref CloudFrontServiceSecurityGroupId, '']]
+  HasMigrationSecret: !Not [!Equals [!Ref MigrationConnectionSecretArn, '']]
+  EnableFreshSeed: !And
+    - !Condition HasMigrationSecret
+    - !Equals [!Ref DBProvisionMode, Fresh]
+    - !Not [!Equals [!Ref SeedPasswordSecretArn, '']]
+
+# Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
+Resources:
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}'
+      RetentionInDays: 14
+
+  TaskExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Pull the Tindy API image and write logs for Tindy runtime tasks.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/tindy-api'
+          - Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${RuntimeLogGroup}:log-stream:*'
+
+  ApiExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      ManagedPolicyArns: [!Ref TaskExecutionPolicy]
+      Policies:
+        - PolicyName: ReadApiStartupSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref DatabaseConnectionSecretArn, !Ref JwtSigningKeySecretArn]
+
+  ApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      Policies:
+        - PolicyName: PersistDataProtectionKeys
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DataProtectionParameterPath}'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DataProtectionParameterPath}/*'
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DataProtectionParameterPath}/*'
+
+  RuntimeCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref 'AWS::StackName'
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-api'
+      Cpu: '512'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt ApiExecutionRole.Arn
+      TaskRoleArn: !GetAtt ApiTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ApiImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - { Name: ASPNETCORE_ENVIRONMENT, Value: Production }
+            - { Name: ASPNETCORE_HTTP_PORTS, Value: '8080' }
+            - { Name: CloudFrontProxy__Enabled, Value: 'true' }
+            - { Name: CloudFrontProxy__PublicHost, Value: !Ref CloudFrontPublicHost }
+            - { Name: CloudFrontProxy__TrustedProxyNetworks__0, Value: !Select [0, !Ref AlbSubnetCidrs] }
+            - { Name: CloudFrontProxy__TrustedProxyNetworks__1, Value: !Select [1, !Ref AlbSubnetCidrs] }
+            - { Name: DataProtection__SsmParameterPath, Value: !Ref DataProtectionParameterPath }
+            - { Name: MediaLifecycle__Enabled, Value: 'false' }
+          Secrets:
+            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref DatabaseConnectionSecretArn }
+            - { Name: Jwt__SigningKey, ValueFrom: !Ref JwtSigningKeySecretArn }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RuntimeLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: api
+
+  AlbIngressFromCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !If [UseCloudFrontServiceSecurityGroup, !Ref 'AWS::NoValue', !Ref CloudFrontOriginPrefixListId]
+      SourceSecurityGroupId: !If [UseCloudFrontServiceSecurityGroup, !Ref CloudFrontServiceSecurityGroupId, !Ref 'AWS::NoValue']
+
+  InternalAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: AlbIngressFromCloudFront
+    Properties:
+      Type: application
+      Scheme: internal
+      IpAddressType: ipv4
+      Subnets: !Ref PrivateAppSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroupId]
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /api/health/ready
+      Matcher: { HttpCode: '200' }
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalAlb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  RuntimeVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    DependsOn: AlbListener
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub '${AWS::StackName}-alb'
+        Arn: !Ref InternalAlb
+        HTTPPort: 80
+        OriginProtocolPolicy: http-only
+        IpAddressType: ipv4
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      ServiceName: tindy-api
+      Cluster: !Ref RuntimeCluster
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref ApiTaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicTaskSubnetIds
+          SecurityGroups: [!Ref EcsSecurityGroupId]
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  MigrationExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: HasMigrationSecret
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      ManagedPolicyArns: [!Ref TaskExecutionPolicy]
+      Policies:
+        - PolicyName: ReadMigrationSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref MigrationConnectionSecretArn
+
+  MigrationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasMigrationSecret
+    Properties:
+      Family: !Sub '${AWS::StackName}-migration'
+      Cpu: '512'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt MigrationExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: migration
+          Image: !Ref ApiImage
+          Essential: true
+          Command: [migrate-db]
+          Environment:
+            - { Name: DOTNET_ENVIRONMENT, Value: Production }
+          Secrets:
+            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref MigrationConnectionSecretArn }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RuntimeLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: migration
+
+  SeedExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableFreshSeed
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      ManagedPolicyArns: [!Ref TaskExecutionPolicy]
+      Policies:
+        - PolicyName: ReadSeedSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref MigrationConnectionSecretArn, !Ref SeedPasswordSecretArn]
+
+  SeedTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: EnableFreshSeed
+    Properties:
+      Family: !Sub '${AWS::StackName}-seed'
+      Cpu: '512'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt SeedExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: seed
+          Image: !Ref ApiImage
+          Essential: true
+          Command: [seed-demo, --fresh]
+          Environment:
+            - { Name: DOTNET_ENVIRONMENT, Value: Production }
+          Secrets:
+            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref MigrationConnectionSecretArn }
+            - { Name: DemoSeed__Password, ValueFrom: !Ref SeedPasswordSecretArn }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RuntimeLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: seed
+
+Outputs:
+  ClusterName:
+    Value: !Ref RuntimeCluster
+
+  ApiServiceName:
+    Value: !GetAtt ApiService.Name
+
+  ApiTaskDefinitionArn:
+    Value: !Ref ApiTaskDefinition
+
+  MigrationTaskDefinitionArn:
+    Condition: HasMigrationSecret
+    Value: !Ref MigrationTaskDefinition
+
+  SeedTaskDefinitionArn:
+    Condition: EnableFreshSeed
+    Value: !Ref SeedTaskDefinition
+
+  ApiTargetGroupArn:
+    Value: !Ref ApiTargetGroup
+
+  AlbDnsName:
+    Value: !GetAtt InternalAlb.DNSName
+
+  VpcOriginId:
+    Value: !GetAtt RuntimeVpcOrigin.Id
