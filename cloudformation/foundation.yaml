@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tindy persistent storage, image registry, and application secrets.
+
+# Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
+Resources:
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireOldFrontendVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Name
+          Value: tindy-frontend
+      # The Edge stack owns the frontend bucket policy and restricts OAC to its distribution.
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Retained database snapshots can reference historical media object versions.
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: tindy-media
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub '${MediaBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+                aws:PrincipalIsAWSService: 'false'
+
+  ApiRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: tindy-api
+      EmptyOnDelete: false
+      ImageTagMutability: IMMUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  JwtSigningKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: tindy/auth/jwt-signing-key
+      Description: Base64-encoded JWT signing key for the Tindy API. Populated after provisioning.
+
+  GoogleOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: tindy/auth/google-oauth
+      Description: Google OAuth client ID and client secret. Populated after provisioning.
+
+  GitHubOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: tindy/auth/github-oauth
+      Description: GitHub OAuth client ID and client secret. Populated after provisioning.
+
+  DatabaseConnectionSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: tindy/database/api-connection
+      Description: Tindy API PostgreSQL connection string. Populated after database provisioning.
+
+Outputs:
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+
+  FrontendBucketArn:
+    Value: !GetAtt FrontendBucket.Arn
+
+  FrontendBucketRegionalDomainName:
+    Description: Regional S3 REST origin for CloudFront.
+    Value: !GetAtt FrontendBucket.RegionalDomainName
+
+  MediaBucketName:
+    Value: !Ref MediaBucket
+
+  MediaBucketArn:
+    Value: !GetAtt MediaBucket.Arn
+
+  ApiRepositoryArn:
+    Value: !GetAtt ApiRepository.Arn
+
+  ApiRepositoryUri:
+    Value: !GetAtt ApiRepository.RepositoryUri
+
+  JwtSigningKeySecretArn:
+    Value: !Ref JwtSigningKeySecret
+
+  GoogleOAuthSecretArn:
+    Value: !Ref GoogleOAuthSecret
+
+  GitHubOAuthSecretArn:
+    Value: !Ref GitHubOAuthSecret
+
+  DatabaseConnectionSecretArn:
+    Value: !Ref DatabaseConnectionSecret
+
+  DataProtectionParameterPath:
+    Description: Reserved SSM path for ASP.NET Core keys created by the API at runtime.
+    Value: /tindy/data-protection
