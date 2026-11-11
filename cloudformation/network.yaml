@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tindy network foundation for us-east-1.
+
+# Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: tindy-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: tindy-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicTaskSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: use1-az1
+      CidrBlock: 10.20.10.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tindy-ecs-public-a
+
+  PublicTaskSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: use1-az2
+      CidrBlock: 10.20.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tindy-ecs-public-b
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: use1-az1
+      CidrBlock: 10.20.20.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tindy-alb-private-a
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: use1-az2
+      CidrBlock: 10.20.21.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tindy-alb-private-b
+
+  PrivateDbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: use1-az1
+      CidrBlock: 10.20.30.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tindy-db-private-a
+
+  PrivateDbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: use1-az2
+      CidrBlock: 10.20.31.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: tindy-db-private-b
+
+  PublicTaskRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: tindy-ecs-public-rt
+
+  PublicTaskDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicTaskRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateAppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: tindy-alb-private-rt
+
+  PrivateDbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: tindy-db-private-rt
+
+  PublicTaskRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicTaskSubnetA
+      RouteTableId: !Ref PublicTaskRouteTable
+
+  PublicTaskRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicTaskSubnetB
+      RouteTableId: !Ref PublicTaskRouteTable
+
+  PrivateAppRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  PrivateAppRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetB
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  PrivateDbRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetA
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  PrivateDbRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetB
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Internal ALB with outbound access to the Tindy API
+      # Runtime owns the CloudFront ingress rule, including bootstrap and tightening.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          DestinationSecurityGroupId: !Ref EcsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: tindy-alb-sg
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Tindy API with HTTPS and PostgreSQL outbound access
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Tags:
+        - Key: Name
+          Value: tindy-ecs-sg
+
+  MigrationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: One-off Tindy migration and seed tasks with no inbound access
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Tags:
+        - Key: Name
+          Value: tindy-migration-sg
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Tindy PostgreSQL with no initiated outbound connections
+      # Suppress the default allow-all egress rule. Replies are allowed by stateful tracking.
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: tindy-db-sg
+
+  ApiIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+
+  DatabaseIngressFromApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+
+  DatabaseIngressFromMigration:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      SourceSecurityGroupId: !Ref MigrationSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+
+  PublicTaskSubnetIds:
+    Description: Subnets for Fargate tasks. Enable public IP assignment in ECS networking.
+    Value: !Join [',', [!Ref PublicTaskSubnetA, !Ref PublicTaskSubnetB]]
+
+  PrivateAppSubnetIds:
+    Description: Subnets for the internal ALB.
+    Value: !Join [',', [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetB]]
+
+  PrivateDbSubnetIds:
+    Description: Subnets for the RDS subnet group.
+    Value: !Join [',', [!Ref PrivateDbSubnetA, !Ref PrivateDbSubnetB]]
+
+  AlbSubnetCidrs:
+    Description: ALB subnet CIDRs for the ASP.NET Core trusted proxy configuration.
+    Value: !Join [',', [!GetAtt PrivateAppSubnetA.CidrBlock, !GetAtt PrivateAppSubnetB.CidrBlock]]
+
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+
+  EcsSecurityGroupId:
+    Value: !Ref EcsSecurityGroup
+
+  MigrationSecurityGroupId:
+    Value: !Ref MigrationSecurityGroup
+
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup
