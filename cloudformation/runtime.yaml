@@ -51,7 +51,7 @@ Parameters:
 
   DatabaseConnectionSecretArn:
     Type: String
-    Description: Foundation secret ARN holding the complete API PostgreSQL connection string as SecretString.
+    Description: Foundation secret ARN holding the API PostgreSQL password and connectionString as JSON keys.
 
   JwtSigningKeySecretArn:
     Type: String
@@ -72,12 +72,23 @@ Parameters:
   MigrationConnectionSecretArn:
     Type: String
     Default: ''
-    Description: Optional ARN for the migration role PostgreSQL connection string as SecretString.
+    Description: Optional ARN holding the migration PostgreSQL password and connectionString as JSON keys.
 
   SeedPasswordSecretArn:
     Type: String
     Default: ''
     Description: Optional ARN for the Fresh seed password as SecretString.
+
+  DBEndpointAddress:
+    Type: String
+    Default: ''
+    AllowedPattern: '([a-z0-9.-]+\.rds\.amazonaws\.com)?'
+    Description: DBEndpointAddress output from tindy-database for the Fresh bootstrap task.
+
+  DBMasterSecretArn:
+    Type: String
+    Default: ''
+    Description: DBMasterSecretArn output from tindy-database. Used only by the Fresh bootstrap task.
 
 Rules:
   RequireCloudFrontIngressSource:
@@ -90,6 +101,11 @@ Rules:
 Conditions:
   UseCloudFrontServiceSecurityGroup: !Not [!Equals [!Ref CloudFrontServiceSecurityGroupId, '']]
   HasMigrationSecret: !Not [!Equals [!Ref MigrationConnectionSecretArn, '']]
+  EnableFreshBootstrap: !And
+    - !Condition HasMigrationSecret
+    - !Equals [!Ref DBProvisionMode, Fresh]
+    - !Not [!Equals [!Ref DBEndpointAddress, '']]
+    - !Not [!Equals [!Ref DBMasterSecretArn, '']]
   EnableFreshSeed: !And
     - !Condition HasMigrationSecret
     - !Equals [!Ref DBProvisionMode, Fresh]
@@ -202,7 +218,7 @@ Resources:
             - { Name: DataProtection__SsmParameterPath, Value: !Ref DataProtectionParameterPath }
             - { Name: MediaLifecycle__Enabled, Value: 'false' }
           Secrets:
-            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref DatabaseConnectionSecretArn }
+            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Sub '${DatabaseConnectionSecretArn}:connectionString::' }
             - { Name: Jwt__SigningKey, ValueFrom: !Ref JwtSigningKeySecretArn }
           LogConfiguration:
             LogDriver: awslogs
@@ -290,6 +306,110 @@ Resources:
           ContainerPort: 8080
           TargetGroupArn: !Ref ApiTargetGroup
 
+  DbBootstrapExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableFreshBootstrap
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      Policies:
+        - PolicyName: BootstrapSecretsAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref DBMasterSecretArn, !Ref DatabaseConnectionSecretArn, !Ref MigrationConnectionSecretArn]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${RuntimeLogGroup}:log-stream:db-bootstrap/*'
+
+  DbBootstrapTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: EnableFreshBootstrap
+    Properties:
+      Family: !Sub '${AWS::StackName}-db-bootstrap'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt DbBootstrapExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: db-bootstrap
+          Image: docker.io/library/postgres@sha256:4717f90960a225c2d1c5dac50508c401230f693ff626e06e84e6db0a68ded508
+          Essential: true
+          User: postgres
+          EntryPoint: [/bin/sh, -ec]
+          Command:
+            - |
+              umask 077
+              export PGSSLROOTCERT=/tmp/rds-ca.pem
+              wget -q -O "$PGSSLROOTCERT" https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem
+
+              echo 'Creating PostgreSQL roles over verified TLS.'
+              # Keep password-bearing SQL out of task logs even if psql reports an error.
+              if ! psql -Xqw -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<'SQL'
+              \getenv api_password TINDY_API_PASSWORD
+              \getenv migration_password TINDY_MIGRATION_PASSWORD
+              BEGIN;
+              SELECT pg_advisory_xact_lock(204817, 9);
+              SELECT format('CREATE ROLE tindy_api LOGIN PASSWORD %L', :'api_password')
+              WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tindy_api')
+              \gexec
+              SELECT format('CREATE ROLE tindy_migrator LOGIN PASSWORD %L', :'migration_password')
+              WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tindy_migrator')
+              \gexec
+              REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+              GRANT CONNECT ON DATABASE tindy TO tindy_api, tindy_migrator;
+              GRANT USAGE ON SCHEMA public TO tindy_api;
+              GRANT USAGE, CREATE ON SCHEMA public TO tindy_migrator;
+              COMMIT;
+              SQL
+              then
+                echo 'Database bootstrap failed while creating roles. Check RDS reachability, TLS and the master credential.' >&2
+                exit 1
+              fi
+
+              echo 'Configuring grants for objects created by the migration role.'
+              PGUSER=tindy_migrator PGPASSWORD="$TINDY_MIGRATION_PASSWORD" psql -Xqw -v ON_ERROR_STOP=1 <<'SQL'
+              BEGIN;
+              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO tindy_api;
+              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO tindy_api;
+              COMMIT;
+              SQL
+
+              echo 'Checking the API role over verified TLS.'
+              api_check=$(PGUSER=tindy_api PGPASSWORD="$TINDY_API_PASSWORD" psql -XwAt -v ON_ERROR_STOP=1 -c "SELECT has_schema_privilege(current_user, 'public', 'USAGE') AND NOT has_schema_privilege(current_user, 'public', 'CREATE');")
+              if [ "$api_check" != t ]; then
+                echo 'Unexpected API privileges on the public schema.' >&2
+                exit 1
+              fi
+              echo 'Database bootstrap complete.'
+          Environment:
+            - { Name: PGHOST, Value: !Ref DBEndpointAddress }
+            - { Name: PGPORT, Value: '5432' }
+            - { Name: PGDATABASE, Value: tindy }
+            - { Name: PGSSLMODE, Value: verify-full }
+            - { Name: PGCONNECT_TIMEOUT, Value: '10' }
+          Secrets:
+            - { Name: PGUSER, ValueFrom: !Sub '${DBMasterSecretArn}:username::' }
+            - { Name: PGPASSWORD, ValueFrom: !Sub '${DBMasterSecretArn}:password::' }
+            - { Name: TINDY_API_PASSWORD, ValueFrom: !Sub '${DatabaseConnectionSecretArn}:password::' }
+            - { Name: TINDY_MIGRATION_PASSWORD, ValueFrom: !Sub '${MigrationConnectionSecretArn}:password::' }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RuntimeLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: db-bootstrap
+
   MigrationExecutionRole:
     Type: AWS::IAM::Role
     Condition: HasMigrationSecret
@@ -331,7 +451,7 @@ Resources:
           Environment:
             - { Name: DOTNET_ENVIRONMENT, Value: Production }
           Secrets:
-            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref MigrationConnectionSecretArn }
+            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Sub '${MigrationConnectionSecretArn}:connectionString::' }
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -380,7 +500,7 @@ Resources:
           Environment:
             - { Name: DOTNET_ENVIRONMENT, Value: Production }
           Secrets:
-            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref MigrationConnectionSecretArn }
+            - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Sub '${MigrationConnectionSecretArn}:connectionString::' }
             - { Name: DemoSeed__Password, ValueFrom: !Ref SeedPasswordSecretArn }
           LogConfiguration:
             LogDriver: awslogs
@@ -398,6 +518,10 @@ Outputs:
 
   ApiTaskDefinitionArn:
     Value: !Ref ApiTaskDefinition
+
+  DbBootstrapTaskDefinitionArn:
+    Condition: EnableFreshBootstrap
+    Value: !Ref DbBootstrapTaskDefinition
 
   MigrationTaskDefinitionArn:
     Condition: HasMigrationSecret
