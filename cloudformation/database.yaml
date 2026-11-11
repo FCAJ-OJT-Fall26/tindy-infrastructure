@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tindy private RDS PostgreSQL 17, provisioned fresh or restored from a snapshot.
+
+Parameters:
+  DBProvisionMode:
+    Type: String
+    Default: Fresh
+    AllowedValues: [Fresh, Restore]
+    Description: Select once at stack creation. Use a separate stack to restore a different snapshot.
+
+  DBSnapshotIdentifier:
+    Type: String
+    Default: ''
+    Description: For Restore, enter the ID or ARN of an available encrypted PostgreSQL 17 manual snapshot.
+
+  PrivateDbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select both subnets from the PrivateDbSubnetIds output of tindy-network.
+
+  DatabaseSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: DatabaseSecurityGroupId output from tindy-network.
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Keep enabled during operation. Disable only for an approved teardown.
+
+Rules:
+  FreshRequiresEmptySnapshot:
+    RuleCondition: !Equals [!Ref DBProvisionMode, Fresh]
+    Assertions:
+      - Assert: !Equals [!Ref DBSnapshotIdentifier, '']
+        AssertDescription: Leave DBSnapshotIdentifier empty for Fresh.
+
+  RestoreRequiresSnapshot:
+    RuleCondition: !Equals [!Ref DBProvisionMode, Restore]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DBSnapshotIdentifier, '']]
+        AssertDescription: Supply DBSnapshotIdentifier for Restore.
+
+Conditions:
+  IsFresh: !Equals [!Ref DBProvisionMode, Fresh]
+  ProtectFromDeletion: !Equals [!Ref EnableDeletionProtection, 'true']
+
+# Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
+Resources:
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Tindy private database subnets in two Availability Zones.
+      SubnetIds: !Ref PrivateDbSubnetIds
+
+  PostgresParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Tindy PostgreSQL 17 parameters requiring TLS connections.
+      Family: postgres17
+      Parameters:
+        rds.force_ssl: '1'
+
+  PostgresInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      # CloudFormation cannot replace a custom-named instance under the same identifier.
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-postgres'
+      Engine: postgres
+      EngineVersion: !If [IsFresh, '17.11', !Ref 'AWS::NoValue']
+      DBInstanceClass: db.t4g.micro
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroupId]
+      DBParameterGroupName: !Ref PostgresParameterGroup
+      Port: '5432'
+      StorageType: gp3
+      AllocatedStorage: !If [IsFresh, '20', !Ref 'AWS::NoValue']
+      StorageEncrypted: !If [IsFresh, true, !Ref 'AWS::NoValue']
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: !If [ProtectFromDeletion, true, false]
+      DBSnapshotIdentifier: !If [IsFresh, !Ref 'AWS::NoValue', !Ref DBSnapshotIdentifier]
+      DBName: !If [IsFresh, tindy, !Ref 'AWS::NoValue']
+      MasterUsername: !If [IsFresh, tindy_admin, !Ref 'AWS::NoValue']
+      ManageMasterUserPassword: !If [IsFresh, true, !Ref 'AWS::NoValue']
+
+Outputs:
+  DBInstanceIdentifier:
+    Value: !Ref PostgresInstance
+
+  DBEndpointAddress:
+    Value: !GetAtt PostgresInstance.Endpoint.Address
+
+  DBEndpointPort:
+    Value: !GetAtt PostgresInstance.Endpoint.Port
+
+  DBProvisionMode:
+    Value: !Ref DBProvisionMode
+
+  DBMasterSecretArn:
+    Condition: IsFresh
+    Description: RDS-managed admin secret for database bootstrap. The API uses a separate DB credential.
+    Value: !GetAtt PostgresInstance.MasterUserSecret.SecretArn
