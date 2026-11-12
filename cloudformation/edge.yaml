@@ -121,6 +121,7 @@ Resources:
               DomainName: !Ref AlbDnsName
               VpcOriginConfig:
                 VpcOriginId: !Ref VpcOriginId
+                OriginReadTimeout: 120
             - !Ref AWS::NoValue
         CustomErrorResponses:
           - { ErrorCode: 403, ErrorCachingMinTTL: 0 }

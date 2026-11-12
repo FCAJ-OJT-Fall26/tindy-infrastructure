@@ -74,6 +74,11 @@ Parameters:
     AllowedPattern: '(arn:aws:secretsmanager:us-east-1:[0-9]{12}:secret:tindy/auth/github-oauth-[a-zA-Z0-9]{6})?'
     Description: Foundation secret ARN containing clientId and clientSecret JSON keys for GitHub.
 
+  BedrockTextEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable text extraction through Bedrock Mantle using the API task role.
   MediaEnabled:
     Type: String
     Default: 'false'
@@ -157,6 +162,7 @@ Rules:
         AssertDescription: Supply the CloudFront IPv4 prefix list or its service-managed security group.
 
 Conditions:
+  EnableBedrockText: !Equals [!Ref BedrockTextEnabled, 'true']
   EnableMedia: !Equals [!Ref MediaEnabled, 'true']
   EnableOAuth: !Equals [!Ref OAuthEnabled, 'true']
   UseCloudFrontServiceSecurityGroup: !Not [!Equals [!Ref CloudFrontServiceSecurityGroupId, '']]
@@ -253,6 +259,19 @@ Resources:
                 Action: ssm:PutParameter
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DataProtectionParameterPath}/*'
         - !If
+          - EnableBedrockText
+          - PolicyName: InvokeGemmaThroughBedrockMantle
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: bedrock-mantle:CreateInference
+                  Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:${AWS::Region}:${AWS::AccountId}:project/default'
+                  Condition:
+                    StringEquals:
+                      'bedrock-mantle:Model': google.gemma-4-31b
+          - !Ref AWS::NoValue
+        - !If
           - EnableMedia
           - PolicyName: ManagePrivateMediaAndConsumeScanResults
             PolicyDocument:
@@ -313,6 +332,9 @@ Resources:
             - { Name: CloudFrontProxy__TrustedProxyNetworks__0, Value: !Select [0, !Ref AlbSubnetCidrs] }
             - { Name: CloudFrontProxy__TrustedProxyNetworks__1, Value: !Select [1, !Ref AlbSubnetCidrs] }
             - { Name: DataProtection__SsmParameterPath, Value: !Ref DataProtectionParameterPath }
+            - { Name: Bedrock__Enabled, Value: !Ref BedrockTextEnabled }
+            - { Name: Bedrock__UseSigV4, Value: !Ref BedrockTextEnabled }
+            - { Name: Bedrock__Region, Value: !Ref 'AWS::Region' }
             - { Name: MediaLifecycle__Enabled, Value: !Ref MediaEnabled }
             - { Name: GuardDuty__Enabled, Value: !Ref MediaEnabled }
             - !If
@@ -397,6 +419,9 @@ Resources:
       IpAddressType: ipv4
       Subnets: !Ref PrivateAppSubnetIds
       SecurityGroups: [!Ref AlbSecurityGroupId]
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '125'
 
   ApiTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
