@@ -76,10 +76,10 @@ Resources:
         deadLetterTargetArn: !GetAtt ScanDeadLetterQueue.Arn
         maxReceiveCount: 5
 
-  ScanQueuesPolicy:
+  ScanQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
-      Queues: [!Ref ScanQueue, !Ref ScanDeadLetterQueue]
+      Queues: [!Ref ScanQueue]
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -87,7 +87,7 @@ Resources:
             Effect: Allow
             Principal: { Service: events.amazonaws.com }
             Action: sqs:SendMessage
-            Resource: [!GetAtt ScanQueue.Arn, !GetAtt ScanDeadLetterQueue.Arn]
+            Resource: !GetAtt ScanQueue.Arn
             Condition:
               ArnEquals:
                 aws:SourceArn: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-certificate-pdf-scan'
@@ -95,7 +95,32 @@ Resources:
             Effect: Deny
             Principal: '*'
             Action: 'sqs:*'
-            Resource: [!GetAtt ScanQueue.Arn, !GetAtt ScanDeadLetterQueue.Arn]
+            Resource: !GetAtt ScanQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+                aws:PrincipalIsAWSService: 'false'
+
+  ScanDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ScanDeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCertificateScanRule
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt ScanDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-certificate-pdf-scan'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt ScanDeadLetterQueue.Arn
             Condition:
               Bool:
                 aws:SecureTransport: 'false'
@@ -103,7 +128,7 @@ Resources:
 
   CertificatePdfProtectionPlan:
     Type: AWS::GuardDuty::MalwareProtectionPlan
-    DependsOn: ScanQueuesPolicy
+    DependsOn: [ScanQueuePolicy, ScanDeadLetterQueuePolicy]
     Properties:
       Role: !GetAtt GuardDutyScanRole.Arn
       ProtectedResource:
