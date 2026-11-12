@@ -1,5 +1,45 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Tindy persistent storage, image registry, and application secrets.
+Description: Tindy persistent storage, image registry, application secrets, and optional GitHub OIDC.
+
+Parameters:
+  GitHubOidcProviderMode:
+    Type: String
+    Default: Disabled
+    AllowedValues: [Disabled, Create, Existing]
+    Description: Create the account-wide GitHub OIDC provider or use the provider already configured in IAM.
+
+  FrontendDeployOidcSubject:
+    Type: String
+    Default: ''
+    AllowedPattern: '(repo:(FCAJ-OJT-Fall26/tindy-platform-frontend|FCAJ-OJT-Fall26@[0-9]+/tindy-platform-frontend@[0-9]+):ref:refs/heads/main)?'
+    Description: Exact subject emitted for the frontend repository on main. Use the format configured in GitHub.
+
+  FrontendDeployDistributionId:
+    Type: String
+    Default: ''
+    AllowedPattern: '[A-Z0-9]*'
+    Description: DistributionId output from tindy-edge. Required together with FrontendDeployOidcSubject.
+
+Rules:
+  FrontendDeployInputs:
+    Assertions:
+      - Assert: !Or
+          - !And
+              - !Equals [!Ref FrontendDeployOidcSubject, '']
+              - !Equals [!Ref FrontendDeployDistributionId, '']
+          - !And
+              - !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
+              - !Not [!Equals [!Ref FrontendDeployOidcSubject, '']]
+              - !Not [!Equals [!Ref FrontendDeployDistributionId, '']]
+        AssertDescription: Provide both frontend deploy parameters and enable GitHub OIDC, or leave both parameters empty.
+
+Conditions:
+  CreateGitHubOidcProvider: !Equals [!Ref GitHubOidcProviderMode, Create]
+  UseGitHubOidcProvider: !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
+  CreateFrontendDeployRole: !And
+    - !Condition UseGitHubOidcProvider
+    - !Not [!Equals [!Ref FrontendDeployOidcSubject, '']]
+    - !Not [!Equals [!Ref FrontendDeployDistributionId, '']]
 
 # Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
 Resources:
@@ -148,6 +188,57 @@ Resources:
       Name: tindy/database/api-connection
       Description: Tindy API PostgreSQL connection string. Populated after database provisioning.
 
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProvider
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  FrontendDeployRole:
+    Type: AWS::IAM::Role
+    Condition: CreateFrontendDeployRole
+    Properties:
+      Description: Publishes the Tindy frontend from GitHub Actions on main.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Ref FrontendDeployOidcSubject
+      Policies:
+        - PolicyName: PublishFrontend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListFrontendObjects
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt FrontendBucket.Arn
+              - Sid: UploadFrontendObjects
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub '${FrontendBucket.Arn}/*'
+              - Sid: InvalidateFrontendCache
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDeployDistributionId}'
+
 Outputs:
   FrontendBucketName:
     Value: !Ref FrontendBucket
@@ -186,3 +277,14 @@ Outputs:
   DataProtectionParameterPath:
     Description: Reserved SSM path for ASP.NET Core keys created by the API at runtime.
     Value: /tindy/data-protection
+
+  GitHubOidcProviderArn:
+    Condition: UseGitHubOidcProvider
+    Value: !If
+      - CreateGitHubOidcProvider
+      - !Ref GitHubOidcProvider
+      - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+
+  FrontendDeployRoleArn:
+    Condition: CreateFrontendDeployRole
+    Value: !GetAtt FrontendDeployRole.Arn
