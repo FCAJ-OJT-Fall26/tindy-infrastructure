@@ -310,6 +310,13 @@ Resources:
                   Effect: Allow
                   Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:DeleteObjectVersion]
                   Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/ai-input/pdf/*'
+                - Sid: ReadCleanAiPdfVersion
+                  Effect: Allow
+                  Action: s3:GetObjectVersion
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/ai-input/pdf/*'
+                  Condition:
+                    StringEquals:
+                      's3:ExistingObjectTag/GuardDutyMalwareScanStatus': NO_THREATS_FOUND
                 - Sid: ConsumeCertificateScanResults
                   Effect: Allow
                   Action: [sqs:GetQueueAttributes, sqs:ReceiveMessage, sqs:DeleteMessage]
