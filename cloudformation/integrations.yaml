@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Tindy certificate PDF scanning and verdict delivery.
+Description: Tindy private PDF scanning and verdict delivery.
 
 Parameters:
   MediaBucketName:
@@ -51,7 +51,9 @@ Resources:
                   - s3:GetObjectVersionTagging
                   - s3:PutObjectTagging
                   - s3:PutObjectVersionTagging
-                Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/certificates/pdf/*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/certificates/pdf/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/ai-input/pdf/*'
 
   ScanDeadLetterQueue:
     Type: AWS::SQS::Queue
@@ -134,7 +136,7 @@ Resources:
       ProtectedResource:
         S3Bucket:
           BucketName: !Ref MediaBucketName
-          ObjectPrefixes: ['certificates/pdf/']
+          ObjectPrefixes: ['certificates/pdf/', 'ai-input/pdf/']
       Actions:
         Tagging:
           Status: ENABLED
@@ -157,6 +159,7 @@ Resources:
             bucketName: [!Ref MediaBucketName]
             objectKey:
               - prefix: certificates/pdf/
+              - prefix: ai-input/pdf/
       Targets:
         - Id: CertificatePdfScanQueue
           Arn: !GetAtt ScanQueue.Arn

@@ -74,6 +74,11 @@ Parameters:
     AllowedPattern: '(arn:aws:secretsmanager:us-east-1:[0-9]{12}:secret:tindy/auth/github-oauth-[a-zA-Z0-9]{6})?'
     Description: Foundation secret ARN containing clientId and clientSecret JSON keys for GitHub.
 
+  AiPdfUploadsEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable AI PDF quarantine uploads after the media scan stack and database schema are ready.
   BedrockTextEnabled:
     Type: String
     Default: 'false'
@@ -137,6 +142,12 @@ Parameters:
     Description: DBMasterSecretArn output from tindy-database. Used only by the Fresh bootstrap task.
 
 Rules:
+  RequireMediaForAiPdfUploads:
+    RuleCondition: !Equals [!Ref AiPdfUploadsEnabled, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref MediaEnabled, 'true']
+        AssertDescription: AI PDF uploads require the media storage and GuardDuty integration.
+
   RequireMediaIntegration:
     RuleCondition: !Equals [!Ref MediaEnabled, 'true']
     Assertions:
@@ -295,6 +306,10 @@ Resources:
                   Effect: Allow
                   Action: s3:ListBucket
                   Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}'
+                - Sid: ManageAiQuarantine
+                  Effect: Allow
+                  Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:DeleteObjectVersion]
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/ai-input/pdf/*'
                 - Sid: ConsumeCertificateScanResults
                   Effect: Allow
                   Action: [sqs:GetQueueAttributes, sqs:ReceiveMessage, sqs:DeleteMessage]
@@ -337,6 +352,7 @@ Resources:
             - { Name: Bedrock__Region, Value: !Ref 'AWS::Region' }
             - { Name: MediaLifecycle__Enabled, Value: !Ref MediaEnabled }
             - { Name: GuardDuty__Enabled, Value: !Ref MediaEnabled }
+            - { Name: GuardDuty__AiPdfUploadsEnabled, Value: !Ref AiPdfUploadsEnabled }
             - !If
               - EnableMedia
               - { Name: MediaStorage__Provider, Value: s3 }
