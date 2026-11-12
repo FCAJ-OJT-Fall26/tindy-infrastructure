@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Tindy certificate PDF scanning and verdict delivery.
+
+Parameters:
+  MediaBucketName:
+    Type: String
+    Description: MediaBucketName output from tindy-foundation in the same Region.
+    AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
+
+Resources:
+  GuardDutyScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: malware-protection-plan.guardduty.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScanCertificatePdfs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageGuardDutyEventRule
+                Effect: Allow
+                Action: [events:PutRule, events:DeleteRule, events:PutTargets, events:RemoveTargets]
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*'
+                Condition:
+                  StringEquals:
+                    events:ManagedBy: malware-protection-plan.guardduty.amazonaws.com
+              - Sid: InspectGuardDutyEventRule
+                Effect: Allow
+                Action: [events:DescribeRule, events:ListTargetsByRule]
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*'
+              - Sid: ConfigureNotificationsAndVerifyBucket
+                Effect: Allow
+                Action: [s3:GetBucketNotification, s3:PutBucketNotification, s3:ListBucket]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}'
+              - Sid: WriteGuardDutyValidationObject
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/malware-protection-resource-validation-object'
+              - Sid: ReadAndTagCertificatePdfVersions
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersionTagging
+                  - s3:PutObjectTagging
+                  - s3:PutObjectVersionTagging
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/certificates/pdf/*'
+
+  ScanDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-pdf-scan-dlq'
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-pdf-scan'
+
+  ScanQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-pdf-scan'
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ScanDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  ScanQueuesPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ScanQueue, !Ref ScanDeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCertificateScanRule
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: [!GetAtt ScanQueue.Arn, !GetAtt ScanDeadLetterQueue.Arn]
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-certificate-pdf-scan'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: [!GetAtt ScanQueue.Arn, !GetAtt ScanDeadLetterQueue.Arn]
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+                aws:PrincipalIsAWSService: 'false'
+
+  CertificatePdfProtectionPlan:
+    Type: AWS::GuardDuty::MalwareProtectionPlan
+    DependsOn: ScanQueuesPolicy
+    Properties:
+      Role: !GetAtt GuardDutyScanRole.Arn
+      ProtectedResource:
+        S3Bucket:
+          BucketName: !Ref MediaBucketName
+          ObjectPrefixes: ['certificates/pdf/']
+      Actions:
+        Tagging:
+          Status: ENABLED
+
+  CertificateScanResultRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-certificate-pdf-scan'
+      Description: Route certificate PDF scan verdicts to the Tindy worker.
+      State: ENABLED
+      EventPattern:
+        source: [aws.guardduty]
+        detail-type: [GuardDuty Malware Protection Object Scan Result]
+        account: [!Ref 'AWS::AccountId']
+        region: [!Ref 'AWS::Region']
+        resources: [!GetAtt CertificatePdfProtectionPlan.Arn]
+        detail:
+          resourceType: [S3_OBJECT]
+          s3ObjectDetails:
+            bucketName: [!Ref MediaBucketName]
+            objectKey:
+              - prefix: certificates/pdf/
+      Targets:
+        - Id: CertificatePdfScanQueue
+          Arn: !GetAtt ScanQueue.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt ScanDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 185
+
+  ScanDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A certificate verdict failed delivery or processing. Inspect the scan DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  GuardDutyProtectionPlanArn:
+    Value: !GetAtt CertificatePdfProtectionPlan.Arn
+
+  GuardDutyProtectionPlanId:
+    Value: !GetAtt CertificatePdfProtectionPlan.MalwareProtectionPlanId
+
+  GuardDutyQueueUrl:
+    Value: !Ref ScanQueue
+
+  GuardDutyQueueArn:
+    Value: !GetAtt ScanQueue.Arn
+
+  GuardDutyDeadLetterQueueUrl:
+    Value: !Ref ScanDeadLetterQueue
+
+  GuardDutyDeadLetterAlarmName:
+    Value: !Ref ScanDeadLetterAlarm

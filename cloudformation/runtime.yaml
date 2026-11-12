@@ -74,6 +74,30 @@ Parameters:
     AllowedPattern: '(arn:aws:secretsmanager:us-east-1:[0-9]{12}:secret:tindy/auth/github-oauth-[a-zA-Z0-9]{6})?'
     Description: Foundation secret ARN containing clientId and clientSecret JSON keys for GitHub.
 
+  MediaEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Enable S3 media, cleanup, and the GuardDuty certificate scan worker together.
+
+  MediaBucketName:
+    Type: String
+    Default: tindy-media-not-configured
+    AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
+    Description: MediaBucketName output from tindy-foundation.
+
+  GuardDutyProtectionPlanArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(arn:aws:guardduty:us-east-1:[0-9]{12}:malware-protection-plan/[A-Za-z0-9-]+)?'
+    Description: GuardDutyProtectionPlanArn output from tindy-integrations.
+
+  GuardDutyQueueUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '(https://sqs\.us-east-1\.amazonaws\.com/[0-9]{12}/tindy-integrations-pdf-scan)?'
+    Description: GuardDutyQueueUrl output from tindy-integrations.
+
   DataProtectionParameterPath:
     Type: String
     Default: /tindy/data-protection
@@ -108,6 +132,15 @@ Parameters:
     Description: DBMasterSecretArn output from tindy-database. Used only by the Fresh bootstrap task.
 
 Rules:
+  RequireMediaIntegration:
+    RuleCondition: !Equals [!Ref MediaEnabled, 'true']
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref MediaBucketName, tindy-media-not-configured]]
+          - !Not [!Equals [!Ref GuardDutyProtectionPlanArn, '']]
+          - !Not [!Equals [!Ref GuardDutyQueueUrl, '']]
+        AssertDescription: Enabling media requires the media bucket, protection plan ARN, and local certificate scan queue.
+
   RequireOAuthSecrets:
     RuleCondition: !Equals [!Ref OAuthEnabled, 'true']
     Assertions:
@@ -124,6 +157,7 @@ Rules:
         AssertDescription: Supply the CloudFront IPv4 prefix list or its service-managed security group.
 
 Conditions:
+  EnableMedia: !Equals [!Ref MediaEnabled, 'true']
   EnableOAuth: !Equals [!Ref OAuthEnabled, 'true']
   UseCloudFrontServiceSecurityGroup: !Not [!Equals [!Ref CloudFrontServiceSecurityGroupId, '']]
   HasMigrationSecret: !Not [!Equals [!Ref MigrationConnectionSecretArn, '']]
@@ -218,6 +252,35 @@ Resources:
               - Effect: Allow
                 Action: ssm:PutParameter
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DataProtectionParameterPath}/*'
+        - !If
+          - EnableMedia
+          - PolicyName: ManagePrivateMediaAndConsumeScanResults
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: ManageMediaObjects
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                    - s3:DeleteObject
+                    - s3:DeleteObjectVersion
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/profiles/avatars/*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/profiles/covers/*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/certificates/images/*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}/certificates/pdf/*'
+                - Sid: DetectMissingObjectsDuringCleanup
+                  # S3 HeadObject returns 403 instead of 404 for missing keys without ListBucket.
+                  Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${MediaBucketName}'
+                - Sid: ConsumeCertificateScanResults
+                  Effect: Allow
+                  Action: [sqs:GetQueueAttributes, sqs:ReceiveMessage, sqs:DeleteMessage]
+                  Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:tindy-integrations-pdf-scan'
+          - !Ref AWS::NoValue
 
   RuntimeCluster:
     Type: AWS::ECS::Cluster
@@ -250,7 +313,40 @@ Resources:
             - { Name: CloudFrontProxy__TrustedProxyNetworks__0, Value: !Select [0, !Ref AlbSubnetCidrs] }
             - { Name: CloudFrontProxy__TrustedProxyNetworks__1, Value: !Select [1, !Ref AlbSubnetCidrs] }
             - { Name: DataProtection__SsmParameterPath, Value: !Ref DataProtectionParameterPath }
-            - { Name: MediaLifecycle__Enabled, Value: 'false' }
+            - { Name: MediaLifecycle__Enabled, Value: !Ref MediaEnabled }
+            - { Name: GuardDuty__Enabled, Value: !Ref MediaEnabled }
+            - !If
+              - EnableMedia
+              - { Name: MediaStorage__Provider, Value: s3 }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: MediaStorage__S3__BucketName, Value: !Ref MediaBucketName }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: MediaStorage__S3__Region, Value: !Ref 'AWS::Region' }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: GuardDuty__BucketName, Value: !Ref MediaBucketName }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: GuardDuty__Region, Value: !Ref 'AWS::Region' }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: GuardDuty__AccountId, Value: !Ref 'AWS::AccountId' }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: GuardDuty__ProtectionPlanArn, Value: !Ref GuardDutyProtectionPlanArn }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableMedia
+              - { Name: GuardDuty__QueueUrl, Value: !Ref GuardDutyQueueUrl }
+              - !Ref AWS::NoValue
             - { Name: OAuth__Enabled, Value: !Ref OAuthEnabled }
             - !If
               - EnableOAuth
