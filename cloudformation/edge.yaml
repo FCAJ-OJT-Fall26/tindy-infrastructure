@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Tindy CloudFront edge in maintenance mode with a private S3 frontend origin.
+Description: Tindy CloudFront edge with a private S3 frontend and optional VPC origin.
 
 Parameters:
   FrontendBucketName:
@@ -7,6 +7,34 @@ Parameters:
     Description: FrontendBucketName output from tindy-foundation in the same Region.
     AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
     ConstraintDescription: Use the generated S3 frontend bucket name without dots.
+
+  EdgeMode:
+    Type: String
+    Default: maintenance
+    AllowedValues: [maintenance, live]
+
+  VpcOriginId:
+    Type: String
+    Default: ''
+    Description: VpcOriginId output from tindy-runtime. Required in live mode.
+
+  AlbDnsName:
+    Type: String
+    Default: ''
+    AllowedPattern: '(internal-[a-zA-Z0-9-]+\.us-east-1\.elb\.amazonaws\.com)?'
+    Description: AlbDnsName output from tindy-runtime. Required in live mode.
+
+Rules:
+  RequireLiveOrigin:
+    RuleCondition: !Equals [!Ref EdgeMode, live]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref VpcOriginId, '']]
+          - !Not [!Equals [!Ref AlbDnsName, '']]
+        AssertDescription: Live mode requires the VPC origin ID and internal ALB DNS name.
+
+Conditions:
+  IsLive: !Equals [!Ref EdgeMode, live]
 
 # Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
 Resources:
@@ -87,6 +115,20 @@ Resources:
             OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
             S3OriginConfig:
               OriginAccessIdentity: ''
+          - !If
+            - IsLive
+            - Id: runtime-vpc
+              DomainName: !Ref AlbDnsName
+              VpcOriginConfig:
+                VpcOriginId: !Ref VpcOriginId
+            - !Ref AWS::NoValue
+        CustomErrorResponses:
+          - { ErrorCode: 403, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 404, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 500, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 502, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 503, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 504, ErrorCachingMinTTL: 0 }
         DefaultCacheBehavior:
           TargetOriginId: frontend-s3
           ViewerProtocolPolicy: redirect-to-https
@@ -106,6 +148,68 @@ Resources:
             Compress: true
             # AWS-managed CachingOptimized for content-hashed Vite assets.
             CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # Forward the viewer Host, Authorization, cookies, WebSocket headers,
+          # and the CloudFront-generated protocol and viewer address headers.
+          - !If
+            - IsLive
+            - PathPattern: '/api'
+              TargetOriginId: runtime-vpc
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+            - !Ref AWS::NoValue
+          - !If
+            - IsLive
+            - PathPattern: '/api/*'
+              TargetOriginId: runtime-vpc
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+            - !Ref AWS::NoValue
+          - !If
+            - IsLive
+            - PathPattern: '/hubs'
+              TargetOriginId: runtime-vpc
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+            - !Ref AWS::NoValue
+          - !If
+            - IsLive
+            - PathPattern: '/hubs/*'
+              TargetOriginId: runtime-vpc
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+            - !Ref AWS::NoValue
+          - !If
+            - IsLive
+            - PathPattern: '/signin-google'
+              TargetOriginId: runtime-vpc
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+            - !Ref AWS::NoValue
+          - !If
+            - IsLive
+            - PathPattern: '/signin-github'
+              TargetOriginId: runtime-vpc
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+            - !Ref AWS::NoValue
 
   FrontendBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -132,4 +236,4 @@ Outputs:
     Value: !GetAtt EdgeDistribution.DomainName
 
   EdgeMode:
-    Value: maintenance
+    Value: !Ref EdgeMode

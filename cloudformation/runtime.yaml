@@ -57,6 +57,23 @@ Parameters:
     Type: String
     Description: Foundation secret ARN holding the Base64 JWT signing key as SecretString.
 
+  OAuthEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+
+  GoogleOAuthSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(arn:aws:secretsmanager:us-east-1:[0-9]{12}:secret:tindy/auth/google-oauth-[a-zA-Z0-9]{6})?'
+    Description: Foundation secret ARN containing clientId and clientSecret JSON keys for Google.
+
+  GitHubOAuthSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(arn:aws:secretsmanager:us-east-1:[0-9]{12}:secret:tindy/auth/github-oauth-[a-zA-Z0-9]{6})?'
+    Description: Foundation secret ARN containing clientId and clientSecret JSON keys for GitHub.
+
   DataProtectionParameterPath:
     Type: String
     Default: /tindy/data-protection
@@ -91,6 +108,14 @@ Parameters:
     Description: DBMasterSecretArn output from tindy-database. Used only by the Fresh bootstrap task.
 
 Rules:
+  RequireOAuthSecrets:
+    RuleCondition: !Equals [!Ref OAuthEnabled, 'true']
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref GoogleOAuthSecretArn, '']]
+          - !Not [!Equals [!Ref GitHubOAuthSecretArn, '']]
+        AssertDescription: Enabling OAuth requires both provider secret ARNs.
+
   RequireCloudFrontIngressSource:
     Assertions:
       - Assert: !Or
@@ -99,6 +124,7 @@ Rules:
         AssertDescription: Supply the CloudFront IPv4 prefix list or its service-managed security group.
 
 Conditions:
+  EnableOAuth: !Equals [!Ref OAuthEnabled, 'true']
   UseCloudFrontServiceSecurityGroup: !Not [!Equals [!Ref CloudFrontServiceSecurityGroupId, '']]
   HasMigrationSecret: !Not [!Equals [!Ref MigrationConnectionSecretArn, '']]
   EnableFreshBootstrap: !And
@@ -159,6 +185,14 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: [!Ref DatabaseConnectionSecretArn, !Ref JwtSigningKeySecretArn]
+              - !If
+                - EnableOAuth
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:tindy/auth/google-oauth-??????'
+                    - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:tindy/auth/github-oauth-??????'
+                - !Ref AWS::NoValue
 
   ApiTaskRole:
     Type: AWS::IAM::Role
@@ -217,9 +251,30 @@ Resources:
             - { Name: CloudFrontProxy__TrustedProxyNetworks__1, Value: !Select [1, !Ref AlbSubnetCidrs] }
             - { Name: DataProtection__SsmParameterPath, Value: !Ref DataProtectionParameterPath }
             - { Name: MediaLifecycle__Enabled, Value: 'false' }
+            - { Name: OAuth__Enabled, Value: !Ref OAuthEnabled }
+            - !If
+              - EnableOAuth
+              - { Name: OAuth__Frontend__AllowedOrigins__0, Value: !Sub 'https://${CloudFrontPublicHost}' }
+              - !Ref AWS::NoValue
           Secrets:
             - { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Sub '${DatabaseConnectionSecretArn}:connectionString::' }
             - { Name: Jwt__SigningKey, ValueFrom: !Ref JwtSigningKeySecretArn }
+            - !If
+              - EnableOAuth
+              - { Name: OAuth__Google__ClientId, ValueFrom: !Sub '${GoogleOAuthSecretArn}:clientId::' }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableOAuth
+              - { Name: OAuth__Google__ClientSecret, ValueFrom: !Sub '${GoogleOAuthSecretArn}:clientSecret::' }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableOAuth
+              - { Name: OAuth__GitHub__ClientId, ValueFrom: !Sub '${GitHubOAuthSecretArn}:clientId::' }
+              - !Ref AWS::NoValue
+            - !If
+              - EnableOAuth
+              - { Name: OAuth__GitHub__ClientSecret, ValueFrom: !Sub '${GitHubOAuthSecretArn}:clientSecret::' }
+              - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:
