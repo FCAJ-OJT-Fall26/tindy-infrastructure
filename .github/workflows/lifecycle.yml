@@ -1,0 +1,71 @@
+name: Run Tindy lifecycle checks
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        type: string
+        required: true
+      confirm:
+        type: string
+        required: true
+      snapshot_id:
+        type: string
+      provision_mode:
+        type: string
+      image_digest:
+        type: string
+      migration_id:
+        type: string
+
+permissions: {}
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      AWS_PAGER: ''
+      ROLE_ARN: ${{ vars.TINDY_LIFECYCLE_ROLE_ARN }}
+      OPERATION: ${{ inputs.operation }}
+      CONFIRM: ${{ inputs.confirm }}
+      SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+      PROVISION_MODE: ${{ inputs.provision_mode }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      MIGRATION_ID: ${{ inputs.migration_id }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate operation
+        run: |
+          case "$OPERATION" in
+            backup|teardown|redeploy) ;;
+            *) exit 1 ;;
+          esac
+          if [[ "$CONFIRM" != "${OPERATION^^} TINDY" ]]; then
+            echo "::error::Enter the exact confirmation shown in the workflow form."
+            exit 1
+          fi
+          if [[ ! "$ROLE_ARN" =~ ^arn:aws:iam::572454213668:role/tindy-foundation-LifecycleRole-[[:alnum:]]+$ ]]; then
+            echo "::error::Set TINDY_LIFECYCLE_ROLE_ARN from the tindy-foundation stack output."
+            exit 1
+          fi
+
+      - name: Assume lifecycle role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ env.ROLE_ARN }}
+          allowed-account-ids: '572454213668'
+          role-duration-seconds: 2700
+          role-session-name: tindy-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Check AWS state
+        run: bash scripts/lifecycle.sh

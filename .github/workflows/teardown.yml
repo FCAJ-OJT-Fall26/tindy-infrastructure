@@ -1,0 +1,31 @@
+name: Teardown Tindy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type TEARDOWN TINDY after freezing writes and reviewing pending work.'
+        required: true
+        type: string
+      snapshot_id:
+        description: 'Verified manual snapshot ID from Backup.'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: tindy-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  teardown:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/lifecycle.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      operation: teardown
+      confirm: ${{ inputs.confirm }}
+      snapshot_id: ${{ inputs.snapshot_id }}

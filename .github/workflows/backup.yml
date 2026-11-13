@@ -1,0 +1,36 @@
+name: Backup Tindy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type BACKUP TINDY after writes are frozen and work has drained.'
+        required: true
+        type: string
+      image_digest:
+        description: 'Current API ECR digest (sha256:...).'
+        required: true
+        type: string
+      migration_id:
+        description: 'Latest verified EF migration ID.'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: tindy-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/lifecycle.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      operation: backup
+      confirm: ${{ inputs.confirm }}
+      image_digest: ${{ inputs.image_digest }}
+      migration_id: ${{ inputs.migration_id }}

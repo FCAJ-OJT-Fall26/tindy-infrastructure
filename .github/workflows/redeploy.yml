@@ -1,0 +1,42 @@
+name: Redeploy Tindy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type REDEPLOY TINDY.'
+        required: true
+        type: string
+      provision_mode:
+        description: 'Select Restore or Fresh.'
+        required: true
+        type: choice
+        options: [Restore, Fresh]
+      snapshot_id:
+        description: 'Manual snapshot ID for Restore. Leave blank for Fresh.'
+        required: false
+        type: string
+      image_digest:
+        description: 'Verified API ECR digest (sha256:...).'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: tindy-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  redeploy:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/lifecycle.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      operation: redeploy
+      confirm: ${{ inputs.confirm }}
+      provision_mode: ${{ inputs.provision_mode }}
+      snapshot_id: ${{ inputs.snapshot_id }}
+      image_digest: ${{ inputs.image_digest }}

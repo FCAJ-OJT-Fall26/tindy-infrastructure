@@ -2,6 +2,12 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Tindy persistent storage, image registry, application secrets, and optional GitHub OIDC.
 
 Parameters:
+  LifecycleWorkflowsEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Allow Tindy lifecycle workflows to verify state and take RDS snapshots.
+
   InfraPlannerEnabled:
     Type: String
     Default: 'false'
@@ -45,6 +51,14 @@ Parameters:
     Description: Task role name from the running API task definition.
 
 Rules:
+  LifecycleInputs:
+    RuleCondition: !Equals [!Ref LifecycleWorkflowsEnabled, 'true']
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
+          - !Not [!Equals [!Ref FrontendDeployDistributionId, '']]
+        AssertDescription: Enable GitHub OIDC and provide the Tindy CloudFront distribution ID.
+
   InfraPlannerInputs:
     RuleCondition: !Equals [!Ref InfraPlannerEnabled, 'true']
     Assertions:
@@ -73,6 +87,9 @@ Rules:
         AssertDescription: Enable GitHub OIDC and provide both API role names to enable backend releases.
 
 Conditions:
+  CreateLifecycleRole: !And
+    - !Condition UseGitHubOidcProvider
+    - !Equals [!Ref LifecycleWorkflowsEnabled, 'true']
   CreateInfraPlannerRole: !Equals [!Ref InfraPlannerEnabled, 'true']
   CreateGitHubOidcProvider: !Equals [!Ref GitHubOidcProviderMode, Create]
   UseGitHubOidcProvider: !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
@@ -388,7 +405,65 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-runtime/*'
                   - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-integrations/*'
 
+  LifecycleRole:
+    Type: AWS::IAM::Role
+    Condition: CreateLifecycleRole
+    Properties:
+      Description: Verifies Tindy lifecycle state and creates manual RDS snapshots.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:FCAJ-OJT-Fall26@337909751/tindy-infrastructure@1453488603:ref:refs/heads/main
+      Policies:
+        - PolicyName: TindyLifecycle
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-foundation/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-network/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-edge/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-database/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-runtime/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-integrations/*'
+              - Effect: Allow
+                Action: [rds:DescribeDBInstances, rds:DescribeDBSnapshots, rds:CreateDBSnapshot]
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:tindy-database-postgres'
+              - Effect: Allow
+                Action: rds:DescribeDBSnapshots
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:tindy-*'
+              - Effect: Allow
+                Action: rds:CreateDBSnapshot
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:tindy-backup-*'
+              - Effect: Allow
+                Action: cloudfront:GetDistribution
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDeployDistributionId}'
+              - Effect: Allow
+                Action: sqs:GetQueueAttributes
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:tindy-integrations-pdf-scan'
+                  - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:tindy-integrations-pdf-scan-dlq'
+              - Effect: Allow
+                Action: ecr:DescribeImages
+                Resource: !GetAtt ApiRepository.Arn
+
 Outputs:
+  LifecycleRoleArn:
+    Condition: CreateLifecycleRole
+    Value: !GetAtt LifecycleRole.Arn
+
   InfraPlannerRoleArn:
     Condition: CreateInfraPlannerRole
     Value: !GetAtt InfraPlannerRole.Arn
