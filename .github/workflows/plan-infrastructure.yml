@@ -1,0 +1,60 @@
+name: Plan infrastructure change
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Existing Tindy stack to preview using the template on main.
+        required: true
+        type: choice
+        options: [foundation, network, edge, database, runtime, integrations]
+
+permissions: {}
+
+concurrency:
+  group: tindy-infrastructure-plan-${{ inputs.stack }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      AWS_PAGER: ''
+      ROLE_ARN: ${{ vars.TINDY_INFRA_PLANNER_ROLE_ARN }}
+      STACK: ${{ inputs.stack }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install template parser
+        run: python -m pip install 'PyYAML==6.0.3'
+
+      - name: Check planner role
+        run: |
+          if [[ ! "$ROLE_ARN" =~ ^arn:aws:iam::572454213668:role/tindy-foundation-InfraPlannerRole-[[:alnum:]]+$ ]]; then
+            echo "::error::Set TINDY_INFRA_PLANNER_ROLE_ARN from the tindy-foundation output."
+            exit 1
+          fi
+
+      - name: Assume planner role through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ env.ROLE_ARN }}
+          allowed-account-ids: '572454213668'
+          role-duration-seconds: 900
+          role-session-name: tindy-infra-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Prepare and summarize the change set
+        run: bash scripts/plan-infrastructure.sh "$STACK"

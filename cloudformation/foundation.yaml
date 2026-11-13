@@ -2,6 +2,12 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Tindy persistent storage, image registry, application secrets, and optional GitHub OIDC.
 
 Parameters:
+  InfraPlannerEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Allow the Tindy infrastructure repository to prepare Change Sets from main.
+
   GitHubOidcProviderMode:
     Type: String
     Default: Disabled
@@ -39,6 +45,12 @@ Parameters:
     Description: Task role name from the running API task definition.
 
 Rules:
+  InfraPlannerInputs:
+    RuleCondition: !Equals [!Ref InfraPlannerEnabled, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
+        AssertDescription: Enable GitHub OIDC before enabling the infrastructure planner.
+
   FrontendDeployInputs:
     Assertions:
       - Assert: !Or
@@ -61,6 +73,7 @@ Rules:
         AssertDescription: Enable GitHub OIDC and provide both API role names to enable backend releases.
 
 Conditions:
+  CreateInfraPlannerRole: !Equals [!Ref InfraPlannerEnabled, 'true']
   CreateGitHubOidcProvider: !Equals [!Ref GitHubOidcProviderMode, Create]
   UseGitHubOidcProvider: !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
   CreateFrontendDeployRole: !And
@@ -335,7 +348,48 @@ Resources:
                   StringEquals:
                     iam:PassedToService: ecs-tasks.amazonaws.com
 
+  InfraPlannerRole:
+    Type: AWS::IAM::Role
+    Condition: CreateInfraPlannerRole
+    Properties:
+      Description: Prepares CloudFormation Change Sets for Tindy stacks from GitHub Actions on main.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:FCAJ-OJT-Fall26@337909751/tindy-infrastructure@1453488603:ref:refs/heads/main
+      Policies:
+        - PolicyName: PlanTindyStacks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-foundation/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-network/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-edge/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-database/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-runtime/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/tindy-integrations/*'
+
 Outputs:
+  InfraPlannerRoleArn:
+    Condition: CreateInfraPlannerRole
+    Value: !GetAtt InfraPlannerRole.Arn
+
   FrontendBucketName:
     Value: !Ref FrontendBucket
 
