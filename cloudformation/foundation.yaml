@@ -353,6 +353,9 @@ Resources:
     Condition: CreateInfraPlannerRole
     Properties:
       Description: Prepares CloudFormation Change Sets for Tindy stacks from GitHub Actions on main.
+      Tags:
+        - Key: Name
+          Value: tindy-infra-planner
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
