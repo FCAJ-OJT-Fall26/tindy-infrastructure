@@ -20,6 +20,24 @@ Parameters:
     AllowedPattern: '[A-Z0-9]*'
     Description: DistributionId output from tindy-edge. Required together with FrontendDeployOidcSubject.
 
+  BackendDeployEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Allow manual backend releases from the Tindy backend repository on main.
+
+  BackendApiExecutionRoleName:
+    Type: String
+    Default: ''
+    AllowedPattern: '(tindy-runtime-ApiExecutionRole-[A-Za-z0-9]+)?'
+    Description: Execution role name from the running API task definition.
+
+  BackendApiTaskRoleName:
+    Type: String
+    Default: ''
+    AllowedPattern: '(tindy-runtime-ApiTaskRole-[A-Za-z0-9]+)?'
+    Description: Task role name from the running API task definition.
+
 Rules:
   FrontendDeployInputs:
     Assertions:
@@ -33,6 +51,15 @@ Rules:
               - !Not [!Equals [!Ref FrontendDeployDistributionId, '']]
         AssertDescription: Provide both frontend deploy parameters and enable GitHub OIDC, or leave both parameters empty.
 
+  BackendDeployInputs:
+    RuleCondition: !Equals [!Ref BackendDeployEnabled, 'true']
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
+          - !Not [!Equals [!Ref BackendApiExecutionRoleName, '']]
+          - !Not [!Equals [!Ref BackendApiTaskRoleName, '']]
+        AssertDescription: Enable GitHub OIDC and provide both API role names to enable backend releases.
+
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref GitHubOidcProviderMode, Create]
   UseGitHubOidcProvider: !Not [!Equals [!Ref GitHubOidcProviderMode, Disabled]]
@@ -40,6 +67,7 @@ Conditions:
     - !Condition UseGitHubOidcProvider
     - !Not [!Equals [!Ref FrontendDeployOidcSubject, '']]
     - !Not [!Equals [!Ref FrontendDeployDistributionId, '']]
+  CreateBackendDeployRole: !Equals [!Ref BackendDeployEnabled, 'true']
 
 # Set Project=Tindy, Environment=tindy, and Owner on the stack at deployment.
 Resources:
@@ -239,6 +267,74 @@ Resources:
                   - cloudfront:GetInvalidation
                 Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDeployDistributionId}'
 
+  BackendDeployRole:
+    Type: AWS::IAM::Role
+    Condition: CreateBackendDeployRole
+    Properties:
+      Description: Publishes the Tindy API image and updates its ECS service from GitHub Actions on main.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:FCAJ-OJT-Fall26@337909751/tindy-platform-backend@1406859196:ref:refs/heads/main
+      Policies:
+        - PolicyName: PublishBackend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AuthenticateToEcr
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: PublishApiImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ApiRepository.Arn
+              - Sid: ReadTaskDefinition
+                Effect: Allow
+                Action: ecs:DescribeTaskDefinition
+                Resource: '*'
+              - Sid: RegisterApiTaskDefinition
+                Effect: Allow
+                Action: ecs:RegisterTaskDefinition
+                Resource: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/tindy-runtime-api:*'
+              - Sid: ReadApiService
+                Effect: Allow
+                Action: ecs:DescribeServices
+                Resource: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/tindy-runtime/tindy-api'
+              - Sid: DeployApiTaskDefinition
+                Effect: Allow
+                Action: ecs:UpdateService
+                Resource: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/tindy-runtime/tindy-api'
+                Condition:
+                  ArnLike:
+                    ecs:task-definition: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/tindy-runtime-api:*'
+              - Sid: PassApiTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${BackendApiExecutionRoleName}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${BackendApiTaskRoleName}'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
 Outputs:
   FrontendBucketName:
     Value: !Ref FrontendBucket
@@ -288,3 +384,7 @@ Outputs:
   FrontendDeployRoleArn:
     Condition: CreateFrontendDeployRole
     Value: !GetAtt FrontendDeployRole.Arn
+
+  BackendDeployRoleArn:
+    Condition: CreateBackendDeployRole
+    Value: !GetAtt BackendDeployRole.Arn
