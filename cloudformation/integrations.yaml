@@ -7,6 +7,17 @@ Parameters:
     Description: MediaBucketName output from tindy-foundation in the same Region.
     AllowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'
 
+  ScanAlarmEmail:
+    Type: String
+    Default: ''
+    NoEcho: true
+    AllowedPattern: '(|[^@\s]+@[^@\s]+\.[^@\s]+)'
+    ConstraintDescription: Enter an email address or leave blank to disable scan alarm notifications.
+    Description: Email recipient for scan alarm notifications. SNS requires subscription confirmation.
+
+Conditions:
+  EnableScanAlarmNotifications: !Not [!Equals [!Ref ScanAlarmEmail, '']]
+
 Resources:
   GuardDutyScanRole:
     Type: AWS::IAM::Role
@@ -169,6 +180,39 @@ Resources:
             MaximumEventAgeInSeconds: 86400
             MaximumRetryAttempts: 185
 
+  ScanAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableScanAlarmNotifications
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-scan-alerts'
+
+  ScanAlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: EnableScanAlarmNotifications
+    Properties:
+      Topics: [!Ref ScanAlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ScanAlarmTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ScanDeadLetterAlarm.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+
+  ScanAlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableScanAlarmNotifications
+    Properties:
+      TopicArn: !Ref ScanAlarmTopic
+      Protocol: email
+      Endpoint: !Ref ScanAlarmEmail
+
   ScanDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -184,6 +228,7 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If [EnableScanAlarmNotifications, [!Ref ScanAlarmTopic], !Ref 'AWS::NoValue']
 
 Outputs:
   GuardDutyProtectionPlanArn:
@@ -203,3 +248,7 @@ Outputs:
 
   GuardDutyDeadLetterAlarmName:
     Value: !Ref ScanDeadLetterAlarm
+
+  ScanAlarmTopicArn:
+    Condition: EnableScanAlarmNotifications
+    Value: !Ref ScanAlarmTopic
