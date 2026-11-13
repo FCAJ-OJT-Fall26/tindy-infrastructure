@@ -445,7 +445,8 @@ Resources:
                 Action: rds:DescribeDBSnapshots
                 Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:tindy-*'
               - Effect: Allow
-                Action: rds:CreateDBSnapshot
+                # The database copies its tags to each manual snapshot.
+                Action: [rds:CreateDBSnapshot, rds:AddTagsToResource]
                 Resource: !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:tindy-backup-*'
               - Effect: Allow
                 Action: cloudfront:GetDistribution
