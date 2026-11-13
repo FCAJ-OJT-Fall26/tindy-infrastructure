@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Tindy private PDF scanning and verdict delivery.
+Description: Tindy private PDF scanning, verdict delivery, and operational alarms.
 
 Parameters:
   MediaBucketName:
@@ -15,8 +15,37 @@ Parameters:
     ConstraintDescription: Enter an email address or leave blank to disable scan alarm notifications.
     Description: Email recipient for scan alarm notifications. SNS requires subscription confirmation.
 
+  AlbMetricLoadBalancer:
+    Type: String
+    Default: ''
+    AllowedPattern: '(|app/[A-Za-z0-9-]+/[a-f0-9]+)'
+    Description: InternalAlb ARN suffix starting with app/. Leave both ALB inputs blank to disable ALB alarms.
+
+  AlbMetricTargetGroup:
+    Type: String
+    Default: ''
+    AllowedPattern: '(|targetgroup/[A-Za-z0-9-]+/[a-f0-9]+)'
+    Description: ApiTargetGroupArn suffix starting with targetgroup/.
+
+Rules:
+  AlbAlarmInputs:
+    Assertions:
+      - Assert: !Or
+          - !And
+              - !Equals [!Ref AlbMetricLoadBalancer, '']
+              - !Equals [!Ref AlbMetricTargetGroup, '']
+          - !And
+              - !Not [!Equals [!Ref AlbMetricLoadBalancer, '']]
+              - !Not [!Equals [!Ref AlbMetricTargetGroup, '']]
+              - !Not [!Equals [!Ref ScanAlarmEmail, '']]
+        AssertDescription: Provide both ALB metric dimensions and an alarm email, or leave both dimensions blank.
+
 Conditions:
   EnableScanAlarmNotifications: !Not [!Equals [!Ref ScanAlarmEmail, '']]
+  EnableAlbAlarms: !And
+    - !Condition EnableScanAlarmNotifications
+    - !Not [!Equals [!Ref AlbMetricLoadBalancer, '']]
+    - !Not [!Equals [!Ref AlbMetricTargetGroup, '']]
 
 Resources:
   GuardDutyScanRole:
@@ -201,7 +230,11 @@ Resources:
             Resource: !Ref ScanAlarmTopic
             Condition:
               ArnEquals:
-                aws:SourceArn: !GetAtt ScanDeadLetterAlarm.Arn
+                aws:SourceArn:
+                  - !GetAtt ScanDeadLetterAlarm.Arn
+                  - !If [EnableAlbAlarms, !GetAtt AlbNoHealthyTargetsAlarm.Arn, !Ref 'AWS::NoValue']
+                  - !If [EnableAlbAlarms, !GetAtt AlbGenerated5xxAlarm.Arn, !Ref 'AWS::NoValue']
+                  - !If [EnableAlbAlarms, !GetAtt ApiTarget5xxAlarm.Arn, !Ref 'AWS::NoValue']
               StringEquals:
                 aws:SourceAccount: !Ref 'AWS::AccountId'
 
@@ -229,6 +262,64 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions: !If [EnableScanAlarmNotifications, [!Ref ScanAlarmTopic], !Ref 'AWS::NoValue']
+
+  AlbNoHealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlbAlarms
+    Properties:
+      AlarmDescription: The Tindy ALB has no healthy API targets or target health data is missing.
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbMetricLoadBalancer
+        - Name: TargetGroup
+          Value: !Ref AlbMetricTargetGroup
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref ScanAlarmTopic]
+
+  AlbGenerated5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlbAlarms
+    Properties:
+      AlarmDescription: The Tindy ALB generated at least 5 HTTP 5xx responses in 5 minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbMetricLoadBalancer
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScanAlarmTopic]
+
+  ApiTarget5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlbAlarms
+    Properties:
+      AlarmDescription: Tindy API targets returned at least 5 HTTP 5xx responses in 5 minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbMetricLoadBalancer
+        - Name: TargetGroup
+          Value: !Ref AlbMetricTargetGroup
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScanAlarmTopic]
 
 Outputs:
   GuardDutyProtectionPlanArn:
