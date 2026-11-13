@@ -62,6 +62,11 @@ Resources:
 
   PostgresInstance:
     Type: AWS::RDS::DBInstance
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F24
+            reason: Fresh uses a fixed bootstrap username and RDS manages the password in Secrets Manager. Restore inherits its master username from the snapshot.
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
     Properties:
